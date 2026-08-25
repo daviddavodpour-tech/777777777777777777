@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set +e
+set -u
+set -o pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [[ -z "$ROOT" ]]; then
+  echo 'ERROR: run this inside a git repository.' >&2
+  exit 1
+fi
+cd "$ROOT"
+
+REMOTE="$(git remote get-url origin 2>/dev/null)"
+BRANCH="$(git branch --show-current 2>/dev/null)"
+[[ -n "$BRANCH" ]] || BRANCH="main"
+
+mkdir -p .github/workflows artifacts local-test-reports
+rm -f .github/workflows/main.yml .github/workflows/main.yaml
+chmod +x android/gradlew tools/*.sh backend/scripts/*.sh 2>/dev/null || true
+
+# Normalize workflow encoding and line endings.
+python3 - <<'PY'
+from pathlib import Path
+p = Path('.github/workflows/hope-ci.yml')
+data = p.read_bytes()
+if data.startswith(b'\xef\xbb\xbf'):
+    data = data[3:]
+data = data.replace(b'\r\n', b'\n').replace(b'\r', b'\n')
+p.write_bytes(data)
+PY
+
+# Validate workflow with Ruby's YAML parser when available.
+if command -v ruby >/dev/null 2>&1; then
+  ruby -ryaml -e 'YAML.safe_load_file(".github/workflows/hope-ci.yml"); puts "Workflow YAML: OK"'
+  YAML_RC=$?
+else
+  YAML_RC=0
+fi
+if [[ $YAML_RC -ne 0 ]]; then
+  echo 'ERROR: local workflow YAML validation failed.' >&2
+  exit 1
+fi
+
+git diff --check
+
+# Commit and push; origin/branch are detected from Git itself.
+git add .github/workflows/hope-ci.yml tools/rebuild_test_build_push.sh
+# Include any project fixes already staged in the working tree.
+git add -A
+
+git commit -m 'ci: rebuild project verification and apk pipeline' || true
+git push origin "$BRANCH"
+PUSH_RC=$?
+
+if [[ $PUSH_RC -ne 0 ]]; then
+  echo 'ERROR: git push failed.' >&2
+  exit $PUSH_RC
+fi
+
+echo
+ echo "Pushed to: $REMOTE"
+echo "Branch: $BRANCH"
+
+if command -v gh >/dev/null 2>&1; then
+  echo 'Waiting for the newest GitHub Actions run...'
+  gh run watch --exit-status --interval 5 || true
+
+  mkdir -p artifacts/github
+  gh run download --name HOPE-debug-apk --dir artifacts/github 2>/dev/null || true
+
+  find artifacts/github -type f -name '*.apk' -print 2>/dev/null
+else
+  echo
+  echo 'GitHub CLI is not installed; the workflow will still run on GitHub.'
+  echo "Run URL: $(git remote get-url origin | sed -E 's#\.git$##')/actions"
+fi
+
+exit 0
