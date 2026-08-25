@@ -1,0 +1,120 @@
+name: HOPE Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  NDK_VERSION: "28.2.13676358"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Dependencies
+        run: flutter pub get
+
+      - name: Repair loop
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "=== Attempt $i/5 ==="
+
+            dart fix --apply || true
+            dart format lib test integration_test || true
+            flutter pub get
+
+            flutter analyze > analyze.log 2>&1
+            A=$?
+
+            flutter test --coverage > test.log 2>&1
+            T=$?
+
+            if [ "$A" -eq 0 ] && [ "$T" -eq 0 ]; then
+              echo "Quality checks passed."
+              break
+            fi
+
+            echo "Quality checks failed."
+          done
+
+      - name: Claude repair
+        if: failure()
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Inspect the current workspace and fix the root cause
+            of the failure.
+
+            Read analyze.log and test.log.
+            Inspect the actual Flutter architecture and tests.
+
+            Do not:
+            - git reset
+            - git clean
+            - checkout another revision
+            - delete tests
+            - silence failures
+
+            Preserve all previous fixes.
+            Run analyze and test again after fixing.
+
+          claude_args: |
+            --max-turns 12
+            --allowedTools Edit,Read,Write,Bash
+
+      - name: Build Debug APK
+        run: |
+          flutter build apk --debug
+
+      - name: Build Release APK
+        run: |
+          flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ github.token }}
+          tag: "build-${{ github.run_number }}"
+          name: "HOPE Build ${{ github.run_number }}"
+          artifacts: build/app/outputs/flutter-apk/app-release.apk
+          body: "HOPE APK"
+
+      - name: Summary
+        run: |
+          URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "# ✅ HOPE APK Ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "[📥 Download APK]($URL)" >> "$GITHUB_STEP_SUMMARY"
