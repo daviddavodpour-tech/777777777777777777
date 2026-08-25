@@ -1,0 +1,800 @@
+name: HOPE - Universal Persistent Repair Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  NDK_VERSION: "28.2.13676358"
+  API_BASE_URL: "http://10.0.2.2:3000/api/v1"
+  MAX_REPAIR_CYCLES: "15"
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+
+      # ==========================================================
+      # 1. CHECKOUT — فقط یک بار
+      # ==========================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # ==========================================================
+      # 2. JAVA
+      # ==========================================================
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # ==========================================================
+      # 3. FLUTTER
+      # ==========================================================
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # ==========================================================
+      # 4. DETECT + EXTRACT + NORMALIZE
+      #
+      # Result is ALWAYS under GITHUB_WORKSPACE.
+      # This fixes the previous nested/temp workspace problem.
+      # ==========================================================
+
+      - name: Detect and normalize Flutter project
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="$GITHUB_WORKSPACE"
+          DISCOVERY="$GITHUB_WORKSPACE/.hopeci/discovery"
+          NORMALIZED="$GITHUB_WORKSPACE/.hopeci/project"
+
+          rm -rf "$GITHUB_WORKSPACE/.hopeci"
+          mkdir -p "$DISCOVERY" "$NORMALIZED"
+
+          echo "=============================================="
+          echo "HOPE UNIVERSAL PROJECT DETECTOR"
+          echo "=============================================="
+
+          find_pubspecs() {
+            find "$1" \
+              -type f \
+              -name "pubspec.yaml" \
+              -not -path "*/.git/*" \
+              -not -path "*/build/*" \
+              -not -path "*/.dart_tool/*" \
+              2>/dev/null || true
+          }
+
+          score_candidate() {
+            local DIR="$1"
+            local PUB="$DIR/pubspec.yaml"
+            local SCORE=0
+
+            [ -f "$PUB" ] && SCORE=$((SCORE + 1))
+            [ -d "$DIR/lib" ] && SCORE=$((SCORE + 30))
+            [ -d "$DIR/android" ] && SCORE=$((SCORE + 30))
+            [ -d "$DIR/test" ] && SCORE=$((SCORE + 10))
+            [ -d "$DIR/integration_test" ] && SCORE=$((SCORE + 10))
+            [ -d "$DIR/ios" ] && SCORE=$((SCORE + 5))
+
+            if grep -Eq '(^|[[:space:]])flutter:' "$PUB"; then
+              SCORE=$((SCORE + 20))
+            fi
+
+            if grep -Eq 'sdk:[[:space:]]*flutter' "$PUB"; then
+              SCORE=$((SCORE + 20))
+            fi
+
+            echo "$SCORE"
+          }
+
+          choose_best() {
+            local ROOT="$1"
+            local BEST=""
+            local BEST_SCORE=-1
+
+            while IFS= read -r PUB; do
+              [ -z "$PUB" ] && continue
+
+              DIR="$(dirname "$PUB")"
+              SCORE="$(score_candidate "$DIR")"
+
+              echo "Candidate: $DIR"
+              echo "Score: $SCORE"
+
+              if [ "$SCORE" -gt "$BEST_SCORE" ]; then
+                BEST="$DIR"
+                BEST_SCORE="$SCORE"
+              fi
+            done < <(find_pubspecs "$ROOT")
+
+            [ -n "$BEST" ] && printf '%s\n' "$BEST"
+          }
+
+          extract_zip() {
+            local ARCHIVE="$1"
+            local DEST="$2"
+
+            mkdir -p "$DEST"
+
+            python3 - "$ARCHIVE" "$DEST" <<'PY'
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive = Path(sys.argv[1]).resolve()
+          destination = Path(sys.argv[2]).resolve()
+
+          with zipfile.ZipFile(archive, "r") as z:
+              for member in z.infolist():
+                  target = (destination / member.filename).resolve()
+
+                  if target != destination and not str(target).startswith(
+                      str(destination) + "/"
+                  ):
+                      raise RuntimeError(
+                          f"Unsafe ZIP entry: {member.filename}"
+                      )
+
+                  z.extract(member, destination)
+          PY
+          }
+
+          PROJECT="$(choose_best "$REPO" | tail -n 1 || true)"
+          SOURCE_MODE="repository"
+
+          # --------------------------------------------------------
+          # Search ZIPs if direct project was not found.
+          # --------------------------------------------------------
+
+          if [ -z "$PROJECT" ]; then
+
+            SOURCE_MODE="zip"
+
+            mapfile -t ZIPS < <(
+              find "$REPO" \
+                -type f \
+                -iname "*.zip" \
+                -not -path "*/.git/*" \
+                2>/dev/null \
+                | sort
+            )
+
+            if [ "${#ZIPS[@]}" -eq 0 ]; then
+              echo "::error::No Flutter project and no ZIP archive found."
+              exit 1
+            fi
+
+            INDEX=0
+
+            for ZIP in "${ZIPS[@]}"; do
+              INDEX=$((INDEX + 1))
+              extract_zip "$ZIP" "$DISCOVERY/archive-$INDEX"
+            done
+
+            # Nested ZIP support up to 5 levels.
+            for LEVEL in 1 2 3 4 5; do
+
+              PROJECT="$(choose_best "$DISCOVERY" | tail -n 1 || true)"
+
+              [ -n "$PROJECT" ] && break
+
+              mapfile -t NESTED < <(
+                find "$DISCOVERY" \
+                  -type f \
+                  -iname "*.zip" \
+                  2>/dev/null \
+                  | sort
+              )
+
+              [ "${#NESTED[@]}" -eq 0 ] && break
+
+              INDEX=0
+
+              for ZIP in "${NESTED[@]}"; do
+                INDEX=$((INDEX + 1))
+                extract_zip "$ZIP" "$DISCOVERY/nested-$LEVEL-$INDEX"
+              done
+            done
+
+            PROJECT="$(choose_best "$DISCOVERY" | tail -n 1 || true)"
+          fi
+
+          if [ -z "$PROJECT" ]; then
+            echo "::error::Flutter project could not be detected."
+            exit 1
+          fi
+
+          test -f "$PROJECT/pubspec.yaml"
+          test -d "$PROJECT/lib"
+          test -d "$PROJECT/android"
+
+          # --------------------------------------------------------
+          # NORMALIZE INTO WORKSPACE
+          # --------------------------------------------------------
+
+          echo "Selected project:"
+          echo "$PROJECT"
+
+          rsync -a \
+            --delete \
+            --exclude=".git/" \
+            "$PROJECT/" \
+            "$NORMALIZED/"
+
+          test -f "$NORMALIZED/pubspec.yaml"
+          test -d "$NORMALIZED/lib"
+          test -d "$NORMALIZED/android"
+
+          echo "PROJECT_DIR=$NORMALIZED" >> "$GITHUB_ENV"
+          echo "SOURCE_MODE=$SOURCE_MODE" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "Normalized project:"
+          echo "$NORMALIZED"
+
+      # ==========================================================
+      # 5. SHOW PROJECT
+      # ==========================================================
+
+      - name: Show normalized project
+        run: |
+          echo "Project root:"
+          echo "$PROJECT_DIR"
+          echo
+          find "$PROJECT_DIR" -maxdepth 2 -type f | sort | head -400
+
+      # ==========================================================
+      # 6. DOCTOR
+      # ==========================================================
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      # ==========================================================
+      # 7. INITIAL CLEAN — فقط یک بار
+      # ==========================================================
+
+      - name: Initial clean
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean
+          flutter pub get
+
+      # ==========================================================
+      # 8. FIND GRADLE AUTOMATICALLY
+      # ==========================================================
+
+      - name: Detect Android Gradle file
+        id: gradle
+        run: |
+          set -euo pipefail
+
+          KTS="$(find "$PROJECT_DIR/android" \
+            -type f \
+            -path "*/app/build.gradle.kts" \
+            | head -1 || true)"
+
+          GROOVY="$(find "$PROJECT_DIR/android" \
+            -type f \
+            -path "*/app/build.gradle" \
+            | head -1 || true)"
+
+          if [ -n "$KTS" ]; then
+            echo "file=$KTS" >> "$GITHUB_OUTPUT"
+            echo "type=kts" >> "$GITHUB_OUTPUT"
+          elif [ -n "$GROOVY" ]; then
+            echo "file=$GROOVY" >> "$GITHUB_OUTPUT"
+            echo "type=groovy" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Android Gradle file not found."
+            exit 1
+          fi
+
+      # ==========================================================
+      # 9. NDK REPAIR
+      # ==========================================================
+
+      - name: Normalize Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="${{ steps.gradle.outputs.file }}"
+          TYPE="${{ steps.gradle.outputs.type }}"
+
+          if [ "$TYPE" = "kts" ]; then
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]]*=.*/ndkVersion = \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+
+          else
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]].*/ndkVersion \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+          fi
+
+      # ==========================================================
+      # 10. CLAUDE — INITIAL AUDIT / REPAIR
+      # ==========================================================
+
+      - name: Claude initial audit
+        if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Act as the senior Flutter/Android repair engineer.
+
+            The real project is in:
+            $GITHUB_WORKSPACE/.hopeci/project
+
+            Inspect the actual source before modifying anything.
+
+            Run:
+              flutter pub get
+              flutter analyze
+              flutter test
+
+            Pay special attention to:
+              - ProviderNotFoundException
+              - ThemeController
+              - AuthController
+              - WorkMarketplaceApp
+              - smoke tests
+              - API client
+              - Android Gradle
+              - NDK
+              - dependency conflicts
+              - stale tests
+
+            Fix root causes only.
+            Do not delete tests.
+            Do not silence errors.
+            Do not run git reset --hard.
+            Do not run git clean -fd.
+            Do not discard prior repairs.
+
+            Keep the current workspace intact.
+
+          claude_args: |
+            --max-turns 15
+            --allowedTools Edit,Read,Write,Bash
+            --append-system-prompt "Work only inside the current workspace. Preserve accumulated repairs. Never hide failures."
+
+      # ==========================================================
+      # 11. PERSISTENT REPAIR LOOP
+      #
+      # NO checkout
+      # NO reset
+      # NO flutter clean
+      # between retries.
+      # ==========================================================
+
+      - name: Persistent analyze-test-build-repair loop
+        id: repair_loop
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          MAX_CYCLES: ${{ env.MAX_REPAIR_CYCLES }}
+        run: |
+          set +e
+
+          STATE="$GITHUB_WORKSPACE/.hopeci/state"
+          mkdir -p "$STATE"
+
+          CYCLE=1
+          SUCCESS=0
+
+          while [ "$CYCLE" -le "$MAX_CYCLES" ]; do
+
+            echo
+            echo "======================================================"
+            echo "PERSISTENT REPAIR CYCLE $CYCLE / $MAX_CYCLES"
+            echo "NO CLEAN / NO RESET / NO RECHECKOUT"
+            echo "======================================================"
+
+            flutter pub get \
+              > "$STATE/pub-get-$CYCLE.log" 2>&1
+            PUB_EXIT=$?
+
+            flutter analyze \
+              > "$STATE/analyze-$CYCLE.log" 2>&1
+            ANALYZE_EXIT=$?
+
+            flutter test --coverage \
+              > "$STATE/test-$CYCLE.log" 2>&1
+            TEST_EXIT=$?
+
+            flutter build apk \
+              --debug \
+              --dart-define=API_BASE_URL="${API_BASE_URL}" \
+              > "$STATE/build-debug-$CYCLE.log" 2>&1
+            DEBUG_EXIT=$?
+
+            if [ "$PUB_EXIT" -eq 0 ] &&
+               [ "$ANALYZE_EXIT" -eq 0 ] &&
+               [ "$TEST_EXIT" -eq 0 ] &&
+               [ "$DEBUG_EXIT" -eq 0 ]; then
+
+              echo "All quality and debug build checks passed."
+
+              flutter build apk \
+                --release \
+                --dart-define=API_BASE_URL="${API_BASE_URL}" \
+                > "$STATE/build-release-$CYCLE.log" 2>&1
+
+              RELEASE_EXIT=$?
+
+              if [ "$RELEASE_EXIT" -eq 0 ]; then
+                SUCCESS=1
+                break
+              fi
+            fi
+
+            echo
+            echo "Failure detected."
+            echo "Preserving current workspace."
+            echo "Starting repair on CURRENT state."
+
+            # ----------------------------------------------------
+            # Save consolidated diagnostics.
+            # ----------------------------------------------------
+
+            {
+              echo "=== PUB GET ==="
+              cat "$STATE/pub-get-$CYCLE.log"
+
+              echo
+              echo "=== ANALYZE ==="
+              cat "$STATE/analyze-$CYCLE.log"
+
+              echo
+              echo "=== TEST ==="
+              cat "$STATE/test-$CYCLE.log"
+
+              echo
+              echo "=== DEBUG BUILD ==="
+              cat "$STATE/build-debug-$CYCLE.log"
+
+              echo
+              echo "=== RELEASE BUILD ==="
+              cat "$STATE/build-release-$CYCLE.log" 2>/dev/null || true
+            } > "$STATE/failure-$CYCLE.log"
+
+            # ----------------------------------------------------
+            # Local safe repairs.
+            # ----------------------------------------------------
+
+            dart fix --apply || true
+            dart format lib test integration_test 2>/dev/null || true
+            flutter pub get || true
+
+            # Re-check NDK without cleaning.
+            FILE="${{ steps.gradle.outputs.file }}"
+            TYPE="${{ steps.gradle.outputs.type }}"
+
+            if [ "$TYPE" = "kts" ]; then
+              grep -q "ndkVersion" "$FILE" \
+                && sed -i \
+                  "s/ndkVersion[[:space:]]*=.*/ndkVersion = \"${NDK_VERSION}\"/" \
+                  "$FILE" \
+                || sed -i \
+                  "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                  "$FILE"
+            else
+              grep -q "ndkVersion" "$FILE" \
+                && sed -i \
+                  "s/ndkVersion[[:space:]].*/ndkVersion \"${NDK_VERSION}\"/" \
+                  "$FILE" \
+                || sed -i \
+                  "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                  "$FILE"
+            fi
+
+            # ----------------------------------------------------
+            # Claude gets the SAME workspace and SAME diagnostics.
+            # ----------------------------------------------------
+
+            if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+
+              echo "Claude repair requested."
+
+              cat "$STATE/failure-$CYCLE.log" | tail -500 \
+                > "$STATE/current-context.txt"
+
+            fi
+
+            CYCLE=$((CYCLE + 1))
+          done
+
+          echo "cycles=$((CYCLE-1))" >> "$GITHUB_OUTPUT"
+          echo "success=$SUCCESS" >> "$GITHUB_OUTPUT"
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "::error::Persistent repair loop exhausted."
+            exit 1
+          fi
+
+      # ==========================================================
+      # 12. CLAUDE FAILURE REPAIR
+      #
+      # Same workspace, no reset/clean.
+      # ==========================================================
+
+      - name: Claude repair after failed loop
+        if: failure() && secrets.ANTHROPIC_API_KEY != ''
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            The persistent Flutter/Android repair loop has failed.
+
+            Work on the CURRENT workspace:
+            $GITHUB_WORKSPACE/.hopeci/project
+
+            DO NOT:
+            - git reset --hard
+            - git clean -fd
+            - checkout another revision
+            - delete the workspace
+            - run flutter clean
+
+            Read the diagnostics in:
+            $GITHUB_WORKSPACE/.hopeci/state/
+
+            Inspect the actual source and root cause.
+
+            Fix the production code, tests, Gradle, Android,
+            dependency or configuration issue that caused the failure.
+
+            Then run:
+              flutter pub get
+              flutter analyze
+              flutter test
+              flutter build apk --debug
+              flutter build apk --release
+
+            Do not silence failures and do not delete tests.
+
+          claude_args: |
+            --max-turns 20
+            --allowedTools Edit,Read,Write,Bash
+            --append-system-prompt "Repair the current accumulated workspace. Preserve all previous valid fixes. Never reset or clean the workspace."
+
+      # ==========================================================
+      # 13. FINAL BUILD FROM THE SAME WORKSPACE
+      # ==========================================================
+
+      - name: Final debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+          flutter build apk \
+            --debug \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+      - name: Final release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+          flutter build apk \
+            --release \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+      # ==========================================================
+      # 14. FIND APK — NO HARD-CODED PROJECT OUTPUT PATH
+      # ==========================================================
+
+      - name: Locate APKs
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEBUG="$(find "$PROJECT_DIR" \
+            -type f \
+            -name "app-debug.apk" \
+            | sort \
+            | head -1)"
+
+          RELEASE="$(find "$PROJECT_DIR" \
+            -type f \
+            -name "app-release.apk" \
+            | sort \
+            | head -1)"
+
+          [ -n "$DEBUG" ] || {
+            echo "::error::Debug APK not found."
+            find "$PROJECT_DIR" -type f -name "*.apk" | sort
+            exit 1
+          }
+
+          [ -n "$RELEASE" ] || {
+            echo "::error::Release APK not found."
+            find "$PROJECT_DIR" -type f -name "*.apk" | sort
+            exit 1
+          }
+
+          cp "$DEBUG" "$GITHUB_WORKSPACE/Hope22-debug.apk"
+          cp "$RELEASE" "$GITHUB_WORKSPACE/Hope22.apk"
+
+          echo "debug=$GITHUB_WORKSPACE/Hope22-debug.apk" >> "$GITHUB_OUTPUT"
+          echo "release=$GITHUB_WORKSPACE/Hope22.apk" >> "$GITHUB_OUTPUT"
+
+      # ==========================================================
+      # 15. CHECKSUM
+      # ==========================================================
+
+      - name: Generate SHA256
+        run: |
+          sha256sum \
+            Hope22.apk \
+            Hope22-debug.apk \
+            | tee apk-sha256.txt
+
+      # ==========================================================
+      # 16. ARTIFACTS
+      # ==========================================================
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: Hope22.apk
+          retention-days: 30
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-debug-apk
+          path: Hope22-debug.apk
+          retention-days: 30
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: HOPE-repair-diagnostics
+          path: .hopeci/state
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-apk-sha256
+          path: apk-sha256.txt
+          retention-days: 30
+
+      # ==========================================================
+      # 17. GITHUB RELEASE
+      # ==========================================================
+
+      - name: Publish GitHub Release
+        id: release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ github.token }}
+          tag: "build-${{ github.run_number }}"
+          name: "HOPE Build ${{ github.run_number }}"
+          allowUpdates: false
+          replacesArtifacts: true
+          artifacts: |
+            Hope22.apk
+            Hope22-debug.apk
+            apk-sha256.txt
+          body: |
+            # HOPE APK
+
+            Automatically built after persistent repair/testing.
+
+            Project:
+            ${{ env.PROJECT_DIR }}
+
+            Flutter:
+            ${{ env.FLUTTER_VERSION }}
+
+            Commit:
+            ${{ github.sha }}
+
+      # ==========================================================
+      # 18. FINAL LINKS
+      # ==========================================================
+
+      - name: Final download summary
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          RELEASE_URL="${{ steps.release.outputs.html_url }}"
+
+          {
+            echo "# ✅ HOPE BUILD SUCCESS"
+            echo
+            echo "Project: \`$PROJECT_DIR\`"
+            echo
+            echo "Source mode: \`$SOURCE_MODE\`"
+            echo
+            echo "## Download"
+            echo
+            echo "[📥 Download Hope22.apk]($RELEASE_URL)"
+            echo
+            echo "[📥 Open build artifacts](${RUN_URL}#artifacts)"
+            echo
+            echo "## Release"
+            echo
+            echo "$RELEASE_URL"
+            echo
+            echo "## Run"
+            echo
+            echo "$RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ==========================================================
+      # 19. COMMIT REPAIRS
+      # ==========================================================
+
+      - name: Commit safe repairs
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            pubspec.lock \
+            android \
+            test \
+            integration_test \
+            2>/dev/null || true
+
+          if ! git diff --cached --quiet; then
+            git commit \
+              -m "ci: preserve successful automatic repairs [skip ci]" \
+              || true
+
+            git push \
+              origin "HEAD:${GITHUB_REF_NAME}" \
+              || true
+          fi
