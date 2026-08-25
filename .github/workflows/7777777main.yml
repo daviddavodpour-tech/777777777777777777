@@ -1,0 +1,283 @@
+name: HOPE Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  NDK_VERSION: "28.2.13676358"
+  API_BASE_URL: "http://10.0.2.2:3000/api/v1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Detect Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT=""
+
+          while IFS= read -r FILE; do
+            DIR="$(dirname "$FILE")"
+
+            if [ -f "$DIR/pubspec.yaml" ] &&
+               [ -d "$DIR/lib" ] &&
+               [ -d "$DIR/android" ]; then
+              PROJECT="$DIR"
+              break
+            fi
+          done < <(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name pubspec.yaml \
+              -not -path "*/.git/*" \
+              -not -path "*/build/*" \
+              -not -path "*/.dart_tool/*" \
+              | sort
+          )
+
+          if [ -z "$PROJECT" ]; then
+            echo "::error::Flutter project not found."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+
+          echo "Flutter project:"
+          echo "$PROJECT"
+
+      - name: Verify project root
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          test -f pubspec.yaml
+          test -d lib
+          test -d android
+
+          echo "Working directory:"
+          pwd
+
+          echo "pubspec.yaml:"
+          ls -lh pubspec.yaml
+
+      - name: Initial dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+
+      - name: Repair NDK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE=""
+
+          if [ -f android/app/build.gradle.kts ]; then
+            FILE="android/app/build.gradle.kts"
+          elif [ -f android/app/build.gradle ]; then
+            FILE="android/app/build.gradle"
+          else
+            echo "::error::Android Gradle file not found."
+            exit 1
+          fi
+
+          if [[ "$FILE" == *.kts ]]; then
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]]*=.*/ndkVersion = \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+          else
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]].*/ndkVersion \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+          fi
+
+      - name: Quality and repair loop
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set +e
+
+          for i in 1 2 3 4 5; do
+            echo "========== Attempt $i/5 =========="
+
+            flutter pub get
+
+            dart fix --apply || true
+            dart format lib test integration_test || true
+
+            flutter analyze > analyze.log 2>&1
+            A=$?
+
+            flutter test --coverage > test.log 2>&1
+            T=$?
+
+            if [ "$A" -eq 0 ] && [ "$T" -eq 0 ]; then
+              echo "Quality checks passed."
+              exit 0
+            fi
+
+            echo "Quality checks failed."
+            echo "Preserving current workspace."
+            echo "No flutter clean."
+            echo "No git reset."
+            echo "No checkout."
+
+          done
+
+          echo "::error::Quality checks did not pass after 5 attempts."
+          exit 1
+
+      - name: Claude repair
+        if: failure() && secrets.ANTHROPIC_API_KEY != ''
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Work on the current Flutter repository.
+
+            Read:
+            - analyze.log
+            - test.log
+            - main.dart
+            - app/root widgets
+            - Provider/controller wiring
+            - failing tests
+
+            Fix the root cause.
+
+            Do NOT:
+            - git reset --hard
+            - git clean -fd
+            - checkout another revision
+            - delete tests
+            - silence failures
+
+            Preserve all existing valid fixes.
+
+            After fixing, run:
+            flutter pub get
+            flutter analyze
+            flutter test
+
+          claude_args: |
+            --max-turns 12
+            --allowedTools Edit,Read,Write,Bash
+
+      - name: Final analyze
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter analyze
+
+      - name: Final tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter test --coverage
+
+      - name: Build Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk \
+            --debug \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+      - name: Build Release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk \
+            --release \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+      - name: Find APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE="$(find "$PROJECT_DIR" \
+            -type f \
+            -name app-release.apk \
+            | head -1)"
+
+          DEBUG="$(find "$PROJECT_DIR" \
+            -type f \
+            -name app-debug.apk \
+            | head -1)"
+
+          test -n "$RELEASE"
+          test -n "$DEBUG"
+
+          cp "$RELEASE" "$GITHUB_WORKSPACE/Hope22.apk"
+          cp "$DEBUG" "$GITHUB_WORKSPACE/Hope22-debug.apk"
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: Hope22.apk
+          retention-days: 30
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-debug-apk
+          path: Hope22-debug.apk
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ github.token }}
+          tag: "build-${{ github.run_number }}"
+          name: "HOPE Build ${{ github.run_number }}"
+          artifacts: Hope22.apk,Hope22-debug.apk
+          body: |
+            HOPE APK build completed.
+
+      - name: Final summary
+        run: |
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          {
+            echo "# ✅ HOPE APK READY"
+            echo
+            echo "[📥 Download APK](${URL}#artifacts)"
+          } >> "$GITHUB_STEP_SUMMARY"
